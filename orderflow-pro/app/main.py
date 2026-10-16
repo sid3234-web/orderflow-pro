@@ -186,15 +186,18 @@ async def market_worker(symbol):
             await asyncio.sleep(2)
 
 
-async def apply_kraken_book_event(book, data):
-    """Apply Kraken v2 L2 book snapshot/update messages; reconnect forces a fresh snapshot."""
+async def apply_kraken_book_event(book, data, message_type):
+    """Apply Kraken v2 L2 book snapshots and incremental updates."""
     if not isinstance(data, dict):
         return
-    if "bids" in data and "asks" in data and not book.valid:
+    if message_type == "snapshot":
         book.load_snapshot({"lastUpdateId": int(time.time() * 1000),
-                            "bids": [[x["price"], x["qty"]] for x in data["bids"]],
-                            "asks": [[x["price"], x["qty"]] for x in data["asks"]]})
+                            "bids": [[x["price"], x["qty"]] for x in data.get("bids", [])],
+                            "asks": [[x["price"], x["qty"]] for x in data.get("asks", [])]})
         book.reason = "live snapshot"
+        return
+    if not book.valid:
+        book.reason = "waiting for fresh book snapshot"
         return
     for key, target in (("bids", book.bids), ("asks", book.asks)):
         for level in data.get(key, []):
@@ -229,8 +232,9 @@ async def depth_worker(symbol):
                         raise RuntimeError(packet.get("error", "Kraken book subscription failed"))
                     if packet.get("channel") != "book":
                         continue
+                    message_type = packet.get("type", "")
                     for ev in packet.get("data", []):
-                        await apply_kraken_book_event(st["book"], ev)
+                        await apply_kraken_book_event(st["book"], ev, message_type)
                     await publish_symbol(symbol)
         except asyncio.CancelledError:
             raise
