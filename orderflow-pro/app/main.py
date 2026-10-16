@@ -4,6 +4,7 @@ import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -21,8 +22,9 @@ load_dotenv(BASE_DIR.parent / ".env")
 STATIC_DIR = BASE_DIR / "static"
 REST = "https://api.kraken.com/0/public"
 WS_URL = "wss://ws.kraken.com/v2"
-# Keep the existing UI symbol IDs while mapping them to Kraken's native pairs.
+# Keep the existing UI symbol IDs while mapping them to Kraken's native WS symbols.
 PAIR_MAP = {"BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD", "SOLUSDT": "SOL/USD"}
+REST_PAIR_MAP = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD", "SOLUSDT": "SOLUSD"}
 requested = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()]
 SYMBOLS = [s for s in requested if s in PAIR_MAP] or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 INTERVAL = os.getenv("KLINE_INTERVAL", "1m")
@@ -52,8 +54,7 @@ for sym in SYMBOLS:
 
 
 def interval_minutes(value):
-    mapping = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
-    return mapping.get(value.lower(), 1)
+    return {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}.get(value.lower(), 1)
 
 
 def normalize_ohlc(row):
@@ -63,14 +64,12 @@ def normalize_ohlc(row):
 
 
 async def fetch_history(symbol):
-    """Fetch recent OHLC candles from Kraken public REST."""
+    """Fetch the recent OHLC candles exposed by Kraken's public REST endpoint."""
     st = state[symbol]
-    pair = PAIR_MAP[symbol]
-    since = int(time.time()) - HISTORY_DAYS * 86400
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(f"{REST}/OHLC", params={
-                "pair": pair.replace("/", ""), "interval": interval_minutes(INTERVAL), "since": since
+                "pair": REST_PAIR_MAP[symbol], "interval": interval_minutes(INTERVAL)
             })
             response.raise_for_status()
             payload = response.json()
@@ -82,15 +81,13 @@ async def fetch_history(symbol):
         st["candles"].clear()
         st["candles"].extend(seen[t] for t in sorted(seen))
         st["last_candle_ts"] = st["candles"][-1]["time"] if st["candles"] else 0
+        if not rows:
+            st["error"] = "Kraken returned no historical candles for this market."
     except Exception as exc:
         st["error"] = f"Kraken candle history: {exc}"
 
 
 def update_live_ohlc(symbol, row):
-    # Kraken WS v2 OHLC fields: interval_begin, open, high, low, close, volume.
-    start = int(row["interval_begin"].replace("Z", "+00:00").replace("T", "T").__class__ is str and 0 or 0)
-    # Parse ISO-8601 timestamps without depending on local timezone.
-    from datetime import datetime
     stamp = row.get("interval_begin") or row.get("timestamp")
     start = int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
     c = {"time": start, "open": float(row["open"]), "high": float(row["high"]),
@@ -169,10 +166,8 @@ async def market_worker(symbol):
                     for ev in packet.get("data", []):
                         if channel == "trade":
                             price, qty = float(ev["price"]), float(ev["qty"])
-                            ts = int(__import__("datetime").datetime.fromisoformat(
-                                ev["timestamp"].replace("Z", "+00:00")).timestamp() * 1000)
+                            ts = int(datetime.fromisoformat(ev["timestamp"].replace("Z", "+00:00")).timestamp() * 1000)
                             side = ev.get("side", "buy").lower()
-                            # Existing aggregator uses buyer_is_maker=True to mean sell-aggressed.
                             buyer_is_maker = side == "sell"
                             st["last_trade"] = {"price": price, "qty": qty,
                                 "buyerIsMaker": buyer_is_maker, "side": side, "time": ts}
@@ -192,7 +187,7 @@ async def market_worker(symbol):
 
 
 async def apply_kraken_book_event(book, data):
-    """Apply Kraken v2 book snapshot/update messages; reconnect forces a fresh snapshot."""
+    """Apply Kraken v2 L2 book snapshot/update messages; reconnect forces a fresh snapshot."""
     if not isinstance(data, dict):
         return
     if "bids" in data and "asks" in data and not book.valid:
