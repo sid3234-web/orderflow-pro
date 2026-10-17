@@ -2,8 +2,9 @@ import asyncio
 import json
 import os
 import time
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -19,29 +20,32 @@ from .orderbook import OrderBook
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR.parent / ".env")
 STATIC_DIR = BASE_DIR / "static"
-REST = "https://api.binance.com"
-WS_BASE = "wss://stream.binance.com:9443/stream?streams="
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()]
+REST = "https://api.kraken.com/0/public"
+WS_URL = "wss://ws.kraken.com/v2"
+# Keep the existing UI symbol IDs while mapping them to Kraken's native WS symbols.
+PAIR_MAP = {"BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD", "SOLUSDT": "SOL/USD"}
+REST_PAIR_MAP = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD", "SOLUSDT": "SOLUSD"}
+requested = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()]
+SYMBOLS = [s for s in requested if s in PAIR_MAP] or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 INTERVAL = os.getenv("KLINE_INTERVAL", "1m")
 HISTORY_DAYS = max(1, min(30, int(os.getenv("HISTORY_DAYS", "30"))))
 MAX_DEPTH_LEVELS = max(20, min(500, int(os.getenv("MAX_DEPTH_LEVELS", "100"))))
 HEATMAP_RETENTION_MINUTES = max(5, min(240, int(os.getenv("HEATMAP_RETENTION_MINUTES", "60"))))
-INTERVAL_MS = 60_000 if INTERVAL == "1m" else 60_000
+INTERVAL_MS = 60_000
 
 state = {}
 clients = set()
 tasks = []
-http_client = None
 
 
 def new_symbol_state(symbol):
     return {
         "symbol": symbol, "candles": deque(maxlen=50000), "book": OrderBook(),
-        "footprint": FootprintAggregator(interval_ms=INTERVAL_MS, tick_size=0.1 if symbol.endswith("USDT") else 0.01),
-        "engine": SignalEngine(), "heatmap": deque(maxlen=HEATMAP_RETENTION_MINUTES * 60),
+        "footprint": FootprintAggregator(interval_ms=INTERVAL_MS, tick_size=0.1 if symbol == "BTCUSDT" else 0.01),
+        "engine": SignalEngine(), "heatmap": deque(maxlen=HEATMAP_RETENTION_MINUTES * 30),
         "last_trade": None, "last_trade_ts": 0, "last_candle_ts": 0,
-        "connection": "starting", "last_alert_key": None, "last_publish_ms": 0, "last_heatmap_ms": 0, "error": None,
-        "trades_recent": deque(maxlen=2000),
+        "connection": "starting", "last_alert_key": None, "last_publish_ms": 0,
+        "last_heatmap_ms": 0, "error": None, "trades_recent": deque(maxlen=2000),
     }
 
 
@@ -49,58 +53,57 @@ for sym in SYMBOLS:
     state[sym] = new_symbol_state(sym)
 
 
-def normalize_kline(k):
-    return {"time": int(k[0] // 1000), "open": float(k[1]), "high": float(k[2]),
-            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+def interval_minutes(value):
+    return {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}.get(value.lower(), 1)
+
+
+def normalize_ohlc(row):
+    return {"time": int(row[0]), "open": float(row[1]), "high": float(row[2]),
+            "low": float(row[3]), "close": float(row[4]), "volume": float(row[6]),
             "closed": True, "source": "historical"}
 
 
 async def fetch_history(symbol):
-    """Load up to 30 days of 1m OHLCV in 1000-candle pages."""
+    """Fetch the recent OHLC candles exposed by Kraken's public REST endpoint."""
     st = state[symbol]
-    end = int(time.time() * 1000)
-    start = end - HISTORY_DAYS * 24 * 60 * 60 * 1000
-    rows = []
-    async with httpx.AsyncClient(timeout=20) as client:
-        cursor = start
-        while cursor < end:
-            response = await client.get(f"{REST}/api/v3/klines",
-                params={"symbol": symbol, "interval": INTERVAL, "startTime": cursor,
-                        "endTime": end, "limit": 1000})
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(f"{REST}/OHLC", params={
+                "pair": REST_PAIR_MAP[symbol], "interval": interval_minutes(INTERVAL)
+            })
             response.raise_for_status()
-            batch = response.json()
-            if not batch:
-                break
-            rows.extend(batch)
-            cursor = int(batch[-1][0]) + 60_000
-            if len(batch) < 1000:
-                break
-            await asyncio.sleep(0.12)
-    seen = {}
-    for k in rows:
-        c = normalize_kline(k)
-        seen[c["time"]] = c
-    st["candles"].clear()
-    st["candles"].extend(seen[t] for t in sorted(seen))
-    st["last_candle_ts"] = st["candles"][-1]["time"] if st["candles"] else 0
+            payload = response.json()
+        if payload.get("error"):
+            raise RuntimeError("; ".join(payload["error"]))
+        result = payload.get("result", {})
+        rows = next((v for k, v in result.items() if k != "last" and isinstance(v, list)), [])
+        seen = {c["time"]: c for c in (normalize_ohlc(row) for row in rows)}
+        st["candles"].clear()
+        st["candles"].extend(seen[t] for t in sorted(seen))
+        st["last_candle_ts"] = st["candles"][-1]["time"] if st["candles"] else 0
+        if not rows:
+            st["error"] = "Kraken returned no historical candles for this market."
+    except Exception as exc:
+        st["error"] = f"Kraken candle history: {exc}"
 
 
-def update_live_kline(symbol, k):
-    st = state[symbol]
-    c = {"time": int(k["t"] // 1000), "open": float(k["o"]), "high": float(k["h"]),
-         "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"]),
-         "closed": bool(k["x"]), "source": "live"}
-    bars = st["candles"]
+def update_live_ohlc(symbol, row):
+    stamp = row.get("interval_begin") or row.get("timestamp")
+    start = int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
+    c = {"time": start, "open": float(row["open"]), "high": float(row["high"]),
+         "low": float(row["low"]), "close": float(row["close"]), "volume": float(row["volume"]),
+         "closed": False, "source": "live"}
+    bars = state[symbol]["candles"]
     if bars and bars[-1]["time"] == c["time"]:
         bars[-1] = c
     elif not bars or bars[-1]["time"] < c["time"]:
         bars.append(c)
-    st["last_candle_ts"] = c["time"]
+    state[symbol]["last_candle_ts"] = c["time"]
 
 
 async def broadcast(payload):
-    dead = []
     msg = json.dumps(payload, separators=(",", ":"))
+    dead = []
     for ws in list(clients):
         try:
             await ws.send_text(msg)
@@ -115,8 +118,7 @@ async def publish_symbol(symbol):
     now_ms = int(time.time() * 1000)
     candles = list(st["candles"])
     footprint = st["footprint"].latest(120)
-    signal = st["engine"].evaluate(symbol, candles, footprint, st["book"].valid, now_ms)
-    # Only create a fresh alert on a side transition; never execute trades.
+    signal = st["engine"].evaluate(symbol, candles, footprint, st["book"].valid, now_ms,\n        book_data=st["book"].top(50), last_trade_ts=st["last_trade_ts"], strict=True)
     if signal["eligible"]:
         key = (signal["side"], candles[-1]["time"] if candles else 0)
         if key != st["last_alert_key"]:
@@ -126,7 +128,6 @@ async def publish_symbol(symbol):
     if st["book"].valid and now_ms - st["last_heatmap_ms"] >= 2000:
         st["heatmap"].append({"ts": now_ms, "bids": book["bids"][:20], "asks": book["asks"][:20]})
         st["last_heatmap_ms"] = now_ms
-    # Evaluate alert rules on incoming updates, but throttle large UI state messages.
     if now_ms - st["last_publish_ms"] < 250:
         return
     st["last_publish_ms"] = now_ms
@@ -134,224 +135,115 @@ async def publish_symbol(symbol):
         "error": st["error"], "lastTrade": st["last_trade"], "candles": candles[-500:],
         "book": book, "footprint": footprint[-30:], "heatmap": list(st["heatmap"]),
         "signal": signal, "serverTime": now_ms,
-        "history": {"days_requested": HISTORY_DAYS, "candle_source": "Binance REST + live stream",
+        "history": {"days_requested": HISTORY_DAYS, "candle_source": "Kraken REST + WebSocket v2",
                     "orderbook_history": "runtime only; starts when app starts",
                     "footprint_history": "runtime only; starts when trades are received"}})
 
 
-async def rest_resync(symbol):
+async def market_worker(symbol):
+    """Subscribe to Kraken v2 trades and OHLC for one market."""
     st = state[symbol]
-    st["book"].valid = False
-    st["book"].reason = "fetching depth snapshot"
-    # Buffer depth events before snapshot to avoid losing events during snapshot fetch.
+    pair = PAIR_MAP[symbol]
     while True:
         try:
-            async with websockets.connect(WS_BASE + f"{symbol.lower()}@depth@100ms",
-                                          ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
-                buffer = []
-                async def collect():
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        ev = msg.get("data", msg)
-                        buffer.append(ev)
-                        if len(buffer) > 5000:
-                            del buffer[:1000]
-                collector = asyncio.create_task(collect())
-                await asyncio.sleep(0.7)
-                async with httpx.AsyncClient(timeout=15) as client:
-                    r = await client.get(f"{REST}/api/v3/depth",
-                                         params={"symbol": symbol, "limit": 1000})
-                    r.raise_for_status()
-                    st["book"].load_snapshot(r.json())
-                # Drop events entirely before snapshot; first bridging event must cover lastUpdateId+1.
-                buffer[:] = [e for e in buffer if int(e.get("u", 0)) > st["book"].last_update_id]
-                bridge_index = None
-                for i, e in enumerate(buffer):
-                    if int(e.get("U", 0)) <= st["book"].last_update_id + 1 <= int(e.get("u", 0)):
-                        bridge_index = i
-                        break
-                if bridge_index is None:
-                    st["book"].valid = False
-                    st["book"].reason = "no bridging depth event; resyncing"
-                    collector.cancel()
-                    await asyncio.sleep(0.5)
-                    continue
-                for ev in buffer[bridge_index:]:
-                    result = st["book"].apply_diff(ev)
-                    if result == "resync":
-                        break
-                if not st["book"].valid:
-                    collector.cancel()
-                    await asyncio.sleep(0.5)
-                    continue
-                # The collector is replaced by a direct consumer. Queue buffered tail then consume stream.
-                collector.cancel()
-                # Reconnect loop below starts a fresh stream; force resnapshot to avoid a gap.
-                st["book"].valid = False
-                st["book"].reason = "reconnecting after buffered sync"
-                await asyncio.sleep(0.3)
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                st["connection"] = "connecting"
+                st["error"] = None
+                await ws.send(json.dumps({"method": "subscribe", "params": {
+                    "channel": "trade", "symbol": [pair], "snapshot": True
+                }}))
+                await ws.send(json.dumps({"method": "subscribe", "params": {
+                    "channel": "ohlc", "symbol": [pair], "interval": interval_minutes(INTERVAL), "snapshot": True
+                }}))
+                st["connection"] = "live"
+                async for raw in ws:
+                    packet = json.loads(raw)
+                    if packet.get("success") is False:
+                        raise RuntimeError(packet.get("error", "Kraken subscription failed"))
+                    channel = packet.get("channel")
+                    if channel not in ("trade", "ohlc"):
+                        continue
+                    for ev in packet.get("data", []):
+                        if channel == "trade":
+                            price, qty = float(ev["price"]), float(ev["qty"])
+                            ts = int(datetime.fromisoformat(ev["timestamp"].replace("Z", "+00:00")).timestamp() * 1000)
+                            side = ev.get("side", "buy").lower()
+                            buyer_is_maker = side == "sell"
+                            st["last_trade"] = {"price": price, "qty": qty,
+                                "buyerIsMaker": buyer_is_maker, "side": side, "time": ts}
+                            st["last_trade_ts"] = ts
+                            st["footprint"].add_trade(price, qty, buyer_is_maker, ts)
+                            st["trades_recent"].append({"price": price, "qty": qty,
+                                "buyerIsMaker": buyer_is_maker, "time": ts})
+                        else:
+                            update_live_ohlc(symbol, ev)
+                    await publish_symbol(symbol)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            st["error"] = f"depth resync: {exc}"
-            st["book"].valid = False
-            st["book"].reason = "depth connection/resync failed"
+            st["connection"] = "reconnecting"
+            st["error"] = f"Kraken market feed: {exc}"
             await asyncio.sleep(2)
+
+
+async def apply_kraken_book_event(book, data, message_type):
+    """Apply Kraken v2 L2 book snapshots and incremental updates."""
+    if not isinstance(data, dict):
+        return
+    if message_type == "snapshot":
+        book.load_snapshot({"lastUpdateId": int(time.time() * 1000),
+                            "bids": [[x["price"], x["qty"]] for x in data.get("bids", [])],
+                            "asks": [[x["price"], x["qty"]] for x in data.get("asks", [])]})
+        book.reason = "live snapshot"
+        return
+    if not book.valid:
+        book.reason = "waiting for fresh book snapshot"
+        return
+    for key, target in (("bids", book.bids), ("asks", book.asks)):
+        for level in data.get(key, []):
+            price, qty = float(level["price"]), float(level["qty"])
+            if qty == 0:
+                target.pop(price, None)
+            else:
+                target[price] = qty
+    if book.bids and book.asks and max(book.bids) >= min(book.asks):
+        book.valid = False
+        book.reason = "crossed/invalid book; resync required"
+        return
+    book.valid = True
+    book.reason = "live"
 
 
 async def depth_worker(symbol):
-    """Snapshot + buffered diff synchronization and continuous diff consumption."""
+    """Consume Kraken v2 L2 book snapshots and updates; reconnect resynchronizes."""
     st = state[symbol]
-    stream_url = WS_BASE + f"{symbol.lower()}@depth@100ms"
+    pair = PAIR_MAP[symbol]
     while True:
         try:
-            st["connection"] = "connecting"
-            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
-                st["connection"] = "live"
-                buffer = []
-                async def receive_until_snapshot():
-                    async for raw in ws:
-                        ev = json.loads(raw).get("data", {})
-                        buffer.append(ev)
-                        if len(buffer) > 8000:
-                            del buffer[:2000]
-                receiver = asyncio.create_task(receive_until_snapshot())
-                await asyncio.sleep(0.5)
-                async with httpx.AsyncClient(timeout=15) as client:
-                    r = await client.get(f"{REST}/api/v3/depth", params={"symbol": symbol, "limit": 1000})
-                    r.raise_for_status()
-                    st["book"].load_snapshot(r.json())
-                buffer[:] = [e for e in buffer if int(e.get("u", 0)) > st["book"].last_update_id]
-                bridge = next((i for i,e in enumerate(buffer)
-                    if int(e.get("U", 0)) <= st["book"].last_update_id + 1 <= int(e.get("u", 0))), None)
-                if bridge is None:
-                    receiver.cancel()
-                    st["book"].valid = False
-                    st["book"].reason = "no bridging event; resync"
-                    await asyncio.sleep(0.5)
-                    continue
-                synced = True
-                for ev in buffer[bridge:]:
-                    if st["book"].apply_diff(ev) == "resync":
-                        synced = False
-                        break
-                if not synced:
-                    receiver.cancel()
-                    await asyncio.sleep(0.5)
-                    continue
-                # Drain the already-buffered event list and then consume the stream in one receiver.
-                receiver.cancel()
-                st["book"].valid = False
-                st["book"].reason = "restarting stream after initial sync"
-                # A fresh snapshot/stream cycle is safer than silently dropping events in this starter.
-                await asyncio.sleep(0.2)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            st["error"] = str(exc)
-            st["connection"] = "reconnecting"
             st["book"].valid = False
-            st["book"].reason = "disconnected; resync required"
-            await asyncio.sleep(2)
-
-
-async def market_worker(symbol):
-    """Combined trade/kline stream, footprint aggregation and live candle updates."""
-    st = state[symbol]
-    streams = f"{symbol.lower()}@trade/{symbol.lower()}@kline_{INTERVAL}"
-    url = WS_BASE + streams
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
-                st["connection"] = "live"
-                st["error"] = None
+            st["book"].reason = "connecting to Kraken order book"
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                await ws.send(json.dumps({"method": "subscribe", "params": {
+                    "channel": "book", "symbol": [pair], "depth": MAX_DEPTH_LEVELS, "snapshot": True
+                }}))
                 async for raw in ws:
                     packet = json.loads(raw)
-                    ev = packet.get("data", {})
-                    kind = ev.get("e")
-                    if kind == "trade":
-                        p, q, maker, ts = float(ev["p"]), float(ev["q"]), bool(ev["m"]), int(ev["T"])
-                        st["last_trade"] = {"price": p, "qty": q, "buyerIsMaker": maker, "time": ts}
-                        st["last_trade_ts"] = ts
-                        st["footprint"].add_trade(p, q, maker, ts)
-                        st["trades_recent"].append({"price": p, "qty": q, "buyerIsMaker": maker, "time": ts})
-                    elif kind == "kline":
-                        update_live_kline(symbol, ev["k"])
+                    if packet.get("success") is False:
+                        raise RuntimeError(packet.get("error", "Kraken book subscription failed"))
+                    if packet.get("channel") != "book":
+                        continue
+                    message_type = packet.get("type", "")
+                    for ev in packet.get("data", []):
+                        await apply_kraken_book_event(st["book"], ev, message_type)
                     await publish_symbol(symbol)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            st["connection"] = "reconnecting"
-            st["error"] = str(exc)
-            await asyncio.sleep(2)
-
-
-async def depth_worker_fixed(symbol):
-    """Correct continuous snapshot/diff loop using a queue to preserve events."""
-    st = state[symbol]
-    url = WS_BASE + f"{symbol.lower()}@depth@100ms"
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
-                queue = asyncio.Queue(maxsize=10000)
-                async def pump():
-                    async for raw in ws:
-                        ev = json.loads(raw).get("data", {})
-                        try:
-                            queue.put_nowait(ev)
-                        except asyncio.QueueFull:
-                            while not queue.empty():
-                                queue.get_nowait()
-                            raise RuntimeError("depth buffer overflow; resync required")
-                pump_task = asyncio.create_task(pump())
-                # Buffer events while obtaining snapshot.
-                buffered = []
-                await asyncio.sleep(0.5)
-                while not queue.empty():
-                    buffered.append(queue.get_nowait())
-                async with httpx.AsyncClient(timeout=15) as client:
-                    r = await client.get(f"{REST}/api/v3/depth", params={"symbol": symbol, "limit": 1000})
-                    r.raise_for_status()
-                    st["book"].load_snapshot(r.json())
-                # Events with u <= snapshot are stale. Find first event spanning lastUpdateId + 1.
-                buffered = [e for e in buffered if int(e.get("u", 0)) > st["book"].last_update_id]
-                idx = next((i for i,e in enumerate(buffered)
-                    if int(e.get("U", 0)) <= st["book"].last_update_id + 1 <= int(e.get("u", 0))), None)
-                if idx is None:
-                    pump_task.cancel()
-                    st["book"].valid = False
-                    st["book"].reason = "awaiting depth bridge; resyncing"
-                    await asyncio.sleep(0.25)
-                    continue
-                ok = True
-                for ev in buffered[idx:]:
-                    if st["book"].apply_diff(ev) == "resync":
-                        ok = False
-                        break
-                if not ok:
-                    pump_task.cancel()
-                    await asyncio.sleep(0.25)
-                    continue
-                st["book"].valid = True
-                st["book"].reason = "live"
-                # Continue consuming queue; gaps invalidate and trigger full resync.
-                while True:
-                    ev = await asyncio.wait_for(queue.get(), timeout=15)
-                    result = st["book"].apply_diff(ev)
-                    if result == "resync":
-                        break
-                    await publish_symbol(symbol)
-                pump_task.cancel()
-                st["book"].valid = False
-                st["book"].reason = "depth gap detected; resyncing"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             st["book"].valid = False
-            st["book"].reason = f"reconnecting: {exc}"
+            st["book"].reason = "disconnected; waiting for fresh snapshot"
             st["connection"] = "reconnecting"
-            st["error"] = str(exc)
-            await asyncio.sleep(1.5)
+            st["error"] = f"Kraken order book: {exc}"
+            await asyncio.sleep(2)
 
 
 async def publisher_worker():
@@ -364,12 +256,11 @@ async def publisher_worker():
 @asynccontextmanager
 async def lifespan(app):
     global tasks
-    # Load REST history concurrently; tolerate endpoint failures and keep UI available.
     await asyncio.gather(*(fetch_history(sym) for sym in SYMBOLS), return_exceptions=True)
     tasks = []
     for sym in SYMBOLS:
         tasks.append(asyncio.create_task(market_worker(sym)))
-        tasks.append(asyncio.create_task(depth_worker_fixed(sym)))
+        tasks.append(asyncio.create_task(depth_worker(sym)))
     tasks.append(asyncio.create_task(publisher_worker()))
     yield
     for task in tasks:
@@ -377,7 +268,7 @@ async def lifespan(app):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-app = FastAPI(title="OrderFlow Pro", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="OrderFlow Pro", version="0.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -388,7 +279,7 @@ async def index():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "symbols": SYMBOLS, "data_mode": "public Binance Spot market data",
+    return {"status": "ok", "symbols": SYMBOLS, "data_mode": "public Kraken Spot REST + WebSocket v2",
             "order_execution": False, "states": {s: {"connection": state[s]["connection"],
             "book_valid": state[s]["book"].valid, "book_reason": state[s]["book"].reason,
             "last_trade_ts": state[s]["last_trade_ts"], "error": state[s]["error"]} for s in SYMBOLS}}
@@ -411,7 +302,6 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     clients.add(ws)
     try:
-        # Initial state for every configured symbol
         for sym in SYMBOLS:
             st = state[sym]
             await ws.send_text(json.dumps({"type": "state", "symbol": sym,
@@ -420,6 +310,7 @@ async def websocket_endpoint(ws: WebSocket):
                 "book": st["book"].top(50), "footprint": st["footprint"].latest(30),
                 "heatmap": list(st["heatmap"]), "history": {
                     "days_requested": HISTORY_DAYS,
+                    "candle_source": "Kraken REST + WebSocket v2",
                     "orderbook_history": "runtime only; starts when app starts",
                     "footprint_history": "runtime only; starts when trades are received"}}))
         while True:

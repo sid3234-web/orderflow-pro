@@ -1,19 +1,19 @@
 # OrderFlow Pro — local crypto order-flow terminal
 
-A local-first, alert-only crypto analytics prototype for Windows. It connects to Binance Spot public market-data endpoints; it does **not** connect to an account, request API keys, or place orders.
+A local-first, alert-only crypto analytics prototype for Windows. It connects to Kraken Spot public market-data endpoints; it does **not** connect to an account, request API keys, or place orders.
 
 ## What is live vs. historical
 
 - **Live:** trade stream, best-effort live candles, synchronized local order book (snapshot + depth diffs), current depth visualization, footprint bars computed from received trades, and rule-based alerts.
-- **Historical candles:** up to 30 days of 1-minute OHLCV fetched from Binance REST when the app starts (subject to API availability and exchange limits).
-- **Not historical:** Binance public streams do not supply a ready-made 30-day historical order-book heatmap or tick-level historical footprint. Heatmap history begins when this app starts; footprint aggregation starts when trades are received. The chart marks historical candles separately from live-updated candles.
+- **Historical candles:** recent OHLCV candles fetched from Kraken REST when the app starts. Kraken's OHLC endpoint limits the number of returned candles (commonly 720), so this is not a guaranteed 30-day 1-minute history.
+- **Not historical:** Kraken public streams do not supply a ready-made historical order-book heatmap or tick-level historical footprint. Heatmap history begins when this app starts; footprint aggregation starts when trades are received. The chart marks historical candles separately from live-updated candles.
 - **Signals:** transparent heuristics, not institutional intelligence or a promise of profitability. A displayed score is not a probability of profit. Alerts are informational only.
 
 ## Requirements
 
 - Windows 10/11
 - Python 3.11+ recommended
-- Internet access to Binance public REST and WebSocket endpoints
+- Internet access to Kraken public REST and WebSocket endpoints
 - No exchange account or API keys needed
 
 ## Run on Windows
@@ -61,10 +61,10 @@ python -m unittest discover -s tests -v
 
 ## Notes / limitations
 
-1. Binance endpoints and stream availability can change; connection status is surfaced in the UI.
-2. The app is configured for Binance Spot. It does not merge books from different exchanges.
+1. Kraken endpoints and stream availability can change; connection status is surfaced in the UI.
+2. The app is configured for Kraken Spot. It does not merge books from different exchanges.
 3. Depth heatmap is a runtime history of sampled resting liquidity, not 30-day archived depth. Historical depth requires a separately sourced dataset or paid provider.
-4. The footprint is trade-derived. Aggressor side is inferred from Binance's `m` field (`m=true` means buyer is maker, therefore seller-initiated trade). It is not an exchange-provided "institutional" classification.
+4. The footprint is trade-derived. Aggressor side is inferred from Kraken's trade `side` field (`sell` is treated as seller-aggressed; `buy` as buyer-aggressed). It is not an exchange-provided "institutional" classification.
 5. The starter signal rules are intentionally conservative and require valid, fresh book data. They must be backtested before any reliance.
 6. Browser notifications require permission and may require HTTPS in some deployment contexts; in localhost, the browser usually treats it as a secure context.
 7. Do not expose this app to the public internet without authentication, TLS, rate limiting, and operational hardening.

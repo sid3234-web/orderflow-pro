@@ -1,4 +1,4 @@
-"""Trade aggregation and transparent, deliberately simple signal rules."""
+"""Trade aggregation and a transparent multi-confirmation signal engine."""
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,11 +26,7 @@ class FootprintBar:
 
 
 class FootprintAggregator:
-    """Aggregates trades into minute bars and price ticks.
-
-    Binance trade event 'm' is isBuyerMaker: true means the buyer was maker,
-    so the trade is classified as seller-aggressed; false is buyer-aggressed.
-    """
+    """Aggregate live aggressor trades into minute bars and price levels."""
     def __init__(self, interval_ms=60_000, tick_size=1.0, max_bars=1200):
         self.interval_ms = interval_ms
         self.tick_size = tick_size
@@ -51,8 +47,7 @@ class FootprintAggregator:
         bar[side] += float(qty)
         bar["trades"] += 1
         while len(self._order) > self.max_bars:
-            old = self._order.popleft()
-            self._bars.pop(old, None)
+            self._bars.pop(self._order.popleft(), None)
 
     def latest(self, limit=30):
         out = []
@@ -65,47 +60,99 @@ class FootprintAggregator:
 
 
 class SignalEngine:
-    """Small explainable demo rules. No machine learning and no trade execution."""
+    """Explainable confluence rules. Never submits or manages orders."""
     def __init__(self):
         self.last_emitted = {}
 
-    def evaluate(self, symbol, candles, footprint, book_valid, now_ms=None):
+    @staticmethod
+    def _wait(reason, now_ms):
+        return {"side": "WAIT", "score": 50, "reasons": [reason],
+                "eligible": False, "confirmations": 0,
+                "timestamp": now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)}
+
+    def evaluate(self, symbol, candles, footprint, book_valid, now_ms=None,
+                 book_data=None, last_trade_ts=None, strict=True):
+        now = now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
         if not book_valid:
-            return {"side": "WAIT", "score": 50, "reasons": ["Order book invalid or resynchronizing."],
-                    "eligible": False, "timestamp": now_ms or int(datetime.now(timezone.utc).timestamp()*1000)}
-        if len(candles) < 20:
-            return {"side": "WAIT", "score": 50, "reasons": ["Need at least 20 candles for trend context."],
-                    "eligible": False, "timestamp": now_ms or int(datetime.now(timezone.utc).timestamp()*1000)}
-        closes = [float(c["close"]) for c in candles[-20:]]
+            return self._wait("Order book invalid or resynchronizing; signals blocked.", now)
+        if len(candles) < 21:
+            return self._wait("Need at least 21 candles to evaluate trend and liquidity sweeps.", now)
+        if not last_trade_ts or now - int(last_trade_ts) > 15_000:
+            return self._wait("Live trade is stale or missing; waiting for fresh exchange data.", now)
+        if candles[-1].get("source") != "live":
+            return self._wait("Waiting for a live exchange candle; historical candles alone cannot trigger alerts.", now)
+
+        recent = candles[-21:]
+        closes = [float(c["close"]) for c in recent]
         last = closes[-1]
-        mean = sum(closes) / len(closes)
-        momentum = (last - closes[-5]) / closes[-5] if closes[-5] else 0
+        prior = recent[:-1]
+        prior_high = max(float(c["high"]) for c in prior if "high" in c)
+        prior_low = min(float(c["low"]) for c in prior if "low" in c)
+        last_candle = recent[-1]
+        bullish_sweep = float(last_candle.get("low", last)) < prior_low and last > prior_low
+        bearish_sweep = float(last_candle.get("high", last)) > prior_high and last < prior_high
+
+        mean = sum(closes[-20:]) / 20
+        momentum = (last - closes[-5]) / closes[-5] if closes[-5] else 0.0
         fp = footprint[-1] if footprint else None
         delta = float(fp["delta"]) if fp else 0.0
-        # Delta is normalized to the current bar's traded volume.
         total = float(fp["buy"] + fp["sell"]) if fp else 0.0
         delta_ratio = delta / total if total else 0.0
-        score = 50
+
+        bids = (book_data or {}).get("bids", [])
+        asks = (book_data or {}).get("asks", [])
+        bid_qty = sum(float(level[1]) for level in bids[:20])
+        ask_qty = sum(float(level[1]) for level in asks[:20])
+        denom = bid_qty + ask_qty
+        book_imbalance = (bid_qty - ask_qty) / denom if denom else 0.0
+
+        long_points, short_points = 0, 0
         reasons = []
         if last > mean:
-            score += 15; reasons.append("Last close is above the 20-bar mean.")
+            long_points += 1; reasons.append("Trend: price is above the 20-bar mean.")
+        elif last < mean:
+            short_points += 1; reasons.append("Trend: price is below the 20-bar mean.")
         else:
-            score -= 15; reasons.append("Last close is below the 20-bar mean.")
+            reasons.append("Trend: price is at the 20-bar mean.")
         if momentum > 0.0005:
-            score += 15; reasons.append("Short-term momentum is positive.")
+            long_points += 1; reasons.append("Momentum: positive over the recent bars.")
         elif momentum < -0.0005:
-            score -= 15; reasons.append("Short-term momentum is negative.")
+            short_points += 1; reasons.append("Momentum: negative over the recent bars.")
         else:
-            reasons.append("Short-term momentum is neutral.")
+            reasons.append("Momentum: neutral; no directional confirmation.")
         if delta_ratio > 0.10:
-            score += 15; reasons.append("Latest footprint shows positive aggressor delta.")
+            long_points += 1; reasons.append("Footprint: buyers dominate aggressor volume.")
         elif delta_ratio < -0.10:
-            score -= 15; reasons.append("Latest footprint shows negative aggressor delta.")
+            short_points += 1; reasons.append("Footprint: sellers dominate aggressor volume.")
         else:
-            reasons.append("Latest footprint delta is mixed or unavailable.")
-        score = max(0, min(100, score))
-        side = "BUY" if score >= 75 else "SELL" if score <= 25 else "WAIT"
-        eligible = side != "WAIT"
-        return {"side": side, "score": score, "reasons": reasons, "eligible": eligible,
-                "delta_ratio": round(delta_ratio, 4),
-                "timestamp": now_ms or int(datetime.now(timezone.utc).timestamp()*1000)}
+            reasons.append("Footprint: delta is mixed or too small.")
+        if book_imbalance > 0.15:
+            long_points += 1; reasons.append("Order book: bid depth outweighs ask depth.")
+        elif book_imbalance < -0.15:
+            short_points += 1; reasons.append("Order book: ask depth outweighs bid depth.")
+        else:
+            reasons.append("Order book: depth imbalance is neutral.")
+        if bullish_sweep:
+            long_points += 2; reasons.append("Liquidity: candle swept a prior low and reclaimed it.")
+        if bearish_sweep:
+            short_points += 2; reasons.append("Liquidity: candle swept a prior high and rejected below it.")
+        if not bullish_sweep and not bearish_sweep:
+            reasons.append("Liquidity: no confirmed sweep-and-reclaim/rejection on the latest candle.")
+
+        direction = "BUY" if long_points > short_points else "SELL" if short_points > long_points else "WAIT"
+        winning = max(long_points, short_points)
+        losing = min(long_points, short_points)
+        score = max(0, min(100, 50 + (winning - losing) * 10))
+        confirmations = winning
+        minimum = 4 if strict else 3
+        eligible = direction != "WAIT" and confirmations >= minimum and winning - losing >= 2
+        if not eligible:
+            reasons.append(f"WAIT: need {minimum} aligned confirmations and a clear directional edge (currently {confirmations}).")
+            direction = "WAIT"
+        return {
+            "side": direction, "score": score, "reasons": reasons, "eligible": eligible,
+            "confirmations": confirmations, "delta_ratio": round(delta_ratio, 4),
+            "book_imbalance": round(book_imbalance, 4),
+            "liquidity_sweep": "bullish" if bullish_sweep else "bearish" if bearish_sweep else None,
+            "entry_reference": last, "timestamp": now,
+        }
