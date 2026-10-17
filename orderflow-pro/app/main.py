@@ -118,7 +118,7 @@ async def publish_symbol(symbol):
     now_ms = int(time.time() * 1000)
     candles = list(st["candles"])
     footprint = st["footprint"].latest(120)
-    signal = st["engine"].evaluate(symbol, candles, footprint, st["book"].valid, now_ms)
+    signal = st["engine"].evaluate(symbol, candles, footprint, st["book"].valid, now_ms,\n        book_data=st["book"].top(50), last_trade_ts=st["last_trade_ts"], strict=True)
     if signal["eligible"]:
         key = (signal["side"], candles[-1]["time"] if candles else 0)
         if key != st["last_alert_key"]:
