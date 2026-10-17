@@ -428,3 +428,30 @@ async def websocket_endpoint(ws: WebSocket):
         pass
     finally:
         clients.discard(ws)
+
+
+@app.get("/api/mt5-signal/{symbol}", response_class=PlainTextResponse)
+async def mt5_signal(symbol: str):
+    """Read-only, compact signal endpoint for the MT5 bridge. Never executes orders."""
+    symbol = symbol.upper()
+    if symbol not in state:
+        return PlainTextResponse("error=unknown_symbol\nallowed=" + ",".join(SYMBOLS), status_code=404)
+    st = state[symbol]
+    now_ms = int(time.time() * 1000)
+    candles = list(st["candles"])
+    signal = st["engine"].evaluate(
+        symbol, candles, st["footprint"].latest(120), st["book"].valid, now_ms
+    )
+    candle_time = int(candles[-1]["time"]) if candles else 0
+    signal_id = f"{symbol}:{candle_time}:{signal['side']}"
+    lines = [
+        f"symbol={symbol}",
+        f"side={signal['side']}",
+        f"score={signal['score']}",
+        f"eligible={'true' if signal['eligible'] else 'false'}",
+        f"signal_id={signal_id}",
+        f"timestamp={signal['timestamp']}",
+        f"book_valid={'true' if st['book'].valid else 'false'}",
+        "execution=disabled",
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n", headers={"Cache-Control": "no-store"})
