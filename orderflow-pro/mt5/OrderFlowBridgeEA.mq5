@@ -4,6 +4,7 @@
 
 #include <Trade/Trade.mqh>
 
+input string InpDashboardSymbol = "BTCUSDT";
 input string InpSignalUrl = "https://orderflow-pro-4m31.onrender.com/api/mt5-signal/BTCUSDT";
 input string InpTradeSymbol = "BTCUSD";
 input double InpLots = 0.01;
